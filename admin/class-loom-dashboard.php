@@ -1,0 +1,460 @@
+<?php
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+class Loom_Dashboard {
+
+	public static function init() {}
+
+	public static function ajax_link_map() {
+		check_ajax_referer( 'loom_nonce', 'nonce' );
+		if ( ! current_user_can( 'edit_posts' ) ) wp_send_json_error( 'Forbidden', 403 );
+
+		global $wpdb;
+		$idx = Loom_DB::index_table();
+		$lnk = Loom_DB::links_table();
+
+		$nodes_raw = $wpdb->get_results(
+			"SELECT post_id, post_title, post_type, incoming_links_count, outgoing_links_count,
+			        is_orphan, site_tier, internal_pagerank, is_dead_end, is_bridge,
+			        is_money_page, is_striking_distance, gsc_position
+			 FROM {$idx} ORDER BY incoming_links_count DESC LIMIT 100", ARRAY_A
+		);
+		$node_ids = wp_list_pluck( $nodes_raw, 'post_id' );
+		if ( empty( $node_ids ) ) { wp_send_json_success( array( 'nodes' => array(), 'edges' => array() ) ); }
+
+		$nodes = array();
+		foreach ( $nodes_raw as $n ) {
+			$nodes[] = array(
+				'id' => intval( $n['post_id'] ), 'label' => mb_substr( $n['post_title'], 0, 22 ),
+				'type' => $n['post_type'], 'in' => intval( $n['incoming_links_count'] ),
+				'out' => intval( $n['outgoing_links_count'] ), 'orphan' => intval( $n['is_orphan'] ),
+				'tier' => intval( $n['site_tier'] ?? 3 ), 'pr' => floatval( $n['internal_pagerank'] ?? 0 ),
+				'dead_end' => intval( $n['is_dead_end'] ?? 0 ), 'bridge' => intval( $n['is_bridge'] ?? 0 ),
+				'money' => intval( $n['is_money_page'] ?? 0 ), 'striking' => intval( $n['is_striking_distance'] ?? 0 ),
+			);
+		}
+
+		$ids_str = implode( ',', array_map( 'intval', $node_ids ) );
+		$edges_raw = $wpdb->get_results(
+			"SELECT source_post_id, target_post_id, is_plugin_generated FROM {$lnk}
+			 WHERE source_post_id IN ({$ids_str}) AND target_post_id IN ({$ids_str}) AND target_post_id > 0", ARRAY_A
+		);
+		$edges = array();
+		foreach ( $edges_raw as $e ) {
+			$edges[] = array( 'from' => intval( $e['source_post_id'] ), 'to' => intval( $e['target_post_id'] ), 'loom' => intval( $e['is_plugin_generated'] ) );
+		}
+		wp_send_json_success( array( 'nodes' => $nodes, 'edges' => $edges ) );
+	}
+
+	public static function render() {
+		if ( ! current_user_can( 'edit_posts' ) ) { wp_die( esc_html__( 'Brak uprawnień.', 'loom' ) ); }
+
+		$has_key  = ! empty( Loom_DB::get_api_key() );
+		$scanned  = get_option( 'loom_scan_completed' );
+		$s        = Loom_DB::get_dashboard_stats();
+		$posts    = Loom_DB::get_all_index_rows();
+		$filter   = sanitize_text_field( $_GET['filter'] ?? '' );
+		$tab      = sanitize_text_field( $_GET['tab'] ?? 'overview' );
+		$settings = Loom_DB::get_settings();
+		$gh       = Loom_Graph::get_health();
+		$gsc_on   = Loom_GSC::is_connected();
+		?>
+		<div class="wrap loom-wrap">
+
+		<!-- HEADER -->
+		<div class="loom-header">
+			<div class="loom-logo">
+				<img src="<?php echo esc_url( LOOM_URL . 'assets/img/logo-wide.png' ); ?>" alt="LOOM" style="height:30px;width:auto">
+			</div>
+			<div class="loom-header-meta">
+				<?php if ( $scanned ) : ?>
+				<span><span class="loom-dot" style="background:var(--ok)"></span> Scan: <?php echo esc_html( $s['total_posts'] ); ?> stron</span>
+				<?php if ( $gsc_on ) : ?>
+				<span><span class="loom-dot" style="background:var(--purple)"></span> GSC: <?php echo esc_html( $s['gsc_synced'] ); ?> stron</span>
+				<?php endif; ?>
+				<span>v<?php echo esc_html( LOOM_VERSION ); ?> · <a href="https://marcinzmuda.com" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none">Marcin Żmuda</a></span>
+				<?php endif; ?>
+			</div>
+		</div>
+
+		<?php if ( ! $scanned ) : ?>
+		<div class="loom-hero">
+			<h2><?php esc_html_e( 'Witaj w LOOM', 'loom' ); ?></h2>
+			<p><?php esc_html_e( 'Przeskanuj stronę, aby zbudować indeks treści i linków.', 'loom' ); ?></p>
+			<button class="loom-btn loom-btn-lg" id="loom-start-scan">🔍 <?php esc_html_e( 'Skanuj stronę', 'loom' ); ?></button>
+			<div id="loom-scan-progress" style="display:none;">
+				<div class="loom-progress loom-progress-lg"><div class="loom-progress-fill" id="loom-progress-fill"></div></div>
+				<p id="loom-progress-text" class="loom-progress-label"></p>
+			</div>
+		</div>
+		<?php else : ?>
+
+		<!-- TABS -->
+		<div class="loom-tabs">
+			<?php
+			$tabs = array(
+				'overview' => '📊 ' . __( 'Przegląd', 'loom' ),
+				'money'    => '💰 Money Pages',
+				'striking' => '🎯 Striking',
+				'graph'    => '🕸️ Graf',
+				'posts'    => '📋 Posty',
+				'settings' => '⚙️ ' . __( 'Ustawienia', 'loom' ),
+			);
+			foreach ( $tabs as $tid => $tlabel ) :
+			?>
+			<a href="<?php echo esc_url( add_query_arg( 'tab', $tid, admin_url( 'admin.php?page=loom' ) ) ); ?>"
+			   class="loom-tab <?php echo $tab === $tid ? 'active' : ''; ?>"><?php echo esc_html( $tlabel ); ?></a>
+			<?php endforeach; ?>
+		</div>
+
+		<?php // ═══ OVERVIEW TAB ═══
+		if ( $tab === 'overview' ) : ?>
+
+		<!-- Top metrics -->
+		<div class="loom-metrics">
+			<?php
+			$metrics = array(
+				array( '📄', $s['total_posts'], __( 'Stron', 'loom' ), false ),
+				array( '🔴', $s['orphans'], __( 'Orphany', 'loom' ), $s['orphans'] > 0 ),
+				array( '⚫', $s['dead_ends'], 'Dead Ends', $s['dead_ends'] > 0 ),
+				array( '🌉', $s['bridges'], 'Bridges', false ),
+				array( '🔗', $s['loom_links'], __( 'Linki LOOM', 'loom' ), false ),
+				array( '🎯', $s['striking_distance'], 'Striking', false ),
+				array( '⭐', $s['money_pages'], 'Money Pages', false ),
+				array( '💰', '$' . $s['api_cost'], __( 'Koszt API', 'loom' ), false ),
+			);
+			foreach ( $metrics as $m ) : ?>
+			<div class="loom-m <?php echo $m[3] ? 'loom-m-alert' : ''; ?>">
+				<div class="loom-m-icon"><?php echo $m[0]; ?></div>
+				<div class="loom-m-val"><?php echo esc_html( $m[1] ); ?></div>
+				<div class="loom-m-lbl"><?php echo esc_html( $m[2] ); ?></div>
+			</div>
+			<?php endforeach; ?>
+		</div>
+
+		<div class="loom-grid-3">
+			<!-- Linking stats -->
+			<div class="loom-card"><div class="loom-card-body">
+				<h3 style="font-size:11px;text-transform:uppercase;color:var(--muted);letter-spacing:.4px;margin-bottom:10px">📊 <?php esc_html_e( 'Linkowanie', 'loom' ); ?></h3>
+				<?php foreach ( array(
+					array( '↗️ Śr. OUT', $s['avg_out_links'] ),
+					array( '↙️ Śr. IN', $s['avg_in_links'] ),
+					array( '🔗 Density', $gh['density'] ?? ' - ' ),
+					array( '🧩 Komponenty', $gh['components'] ?? ' - ' ),
+					array( '📐 Max depth', $s['max_depth'] ),
+					array( '❌ Broken', $s['broken_links'] ),
+				) as $row ) : ?>
+				<div class="loom-stat-row"><span class="loom-stat-label"><?php echo esc_html( $row[0] ); ?></span><span class="loom-stat-value"><?php echo esc_html( $row[1] ); ?></span></div>
+				<?php endforeach; ?>
+			</div></div>
+
+			<!-- Equity distribution -->
+			<div class="loom-card"><div class="loom-card-body">
+				<h3 style="font-size:11px;text-transform:uppercase;color:var(--muted);letter-spacing:.4px;margin-bottom:10px">⚖️ <?php esc_html_e( 'Equity', 'loom' ); ?></h3>
+				<?php if ( ! empty( $gh['equity_top10'] ) ) : $t10 = $gh['equity_top10']; $b50 = $gh['bot50_equity'] ?? 0; ?>
+				<div class="loom-eq-label"><?php printf( esc_html__( 'Top 10%%: %d%% equity', 'loom' ), $t10 ); ?></div>
+				<div class="loom-progress" style="margin-bottom:10px"><div class="loom-progress-fill" style="width:<?php echo esc_attr( $t10 ); ?>%"></div></div>
+				<div class="loom-eq-label"><?php printf( esc_html__( 'Bottom 50%%: %d%% equity', 'loom' ), $b50 ); ?></div>
+				<div class="loom-progress"><div class="loom-progress-fill <?php echo $b50 < 20 ? 'loom-progress-fill-bad' : 'loom-progress-fill-ok'; ?>" style="width:<?php echo esc_attr( $b50 ); ?>%"></div></div>
+				<p style="font-size:10px;color:var(--muted);margin-top:8px"><?php echo $b50 < 20 ? '⚠️ Zbyt duża koncentracja equity' : '✅ Rozkład akceptowalny'; ?></p>
+				<?php else : ?>
+				<p class="loom-muted" style="font-size:12px"><?php esc_html_e( 'Przelicz graf aby zobaczyć equity.', 'loom' ); ?></p>
+				<?php endif; ?>
+			</div></div>
+
+			<!-- Quick actions -->
+			<div class="loom-card"><div class="loom-card-body">
+				<h3 style="font-size:11px;text-transform:uppercase;color:var(--muted);letter-spacing:.4px;margin-bottom:10px">⚡ <?php esc_html_e( 'Szybkie akcje', 'loom' ); ?></h3>
+				<div style="display:flex;flex-direction:column;gap:6px">
+				<?php if ( $s['orphans'] > 0 ) : ?><button class="loom-action-btn loom-action-red">🔴 <?php printf( esc_html__( 'Napraw %d orphanów', 'loom' ), $s['orphans'] ); ?></button><?php endif; ?>
+				<?php if ( $s['dead_ends'] > 0 ) : ?><button class="loom-action-btn loom-action-amber">⚫ <?php printf( esc_html__( 'Napraw %d dead endów', 'loom' ), $s['dead_ends'] ); ?></button><?php endif; ?>
+				<?php if ( $s['striking_distance'] > 0 ) : ?><button class="loom-action-btn loom-action-purple">🎯 <?php printf( esc_html__( 'Boost %d striking distance', 'loom' ), $s['striking_distance'] ); ?></button><?php endif; ?>
+				<?php if ( $s['money_deficit'] > 0 ) : ?><button class="loom-action-btn loom-action-yellow">⭐ <?php esc_html_e( 'Wzmocnij money pages', 'loom' ); ?></button><?php endif; ?>
+				<button class="loom-action-btn" style="background:#f1f5f9;color:#374151" id="loom-start-scan">🔄 <?php esc_html_e( 'Przeskanuj ponownie', 'loom' ); ?></button>
+				</div>
+				<div id="loom-scan-progress" style="display:none;margin-top:8px">
+					<div class="loom-progress"><div class="loom-progress-fill" id="loom-progress-fill"></div></div>
+					<p id="loom-progress-text" class="loom-progress-label"></p>
+				</div>
+			</div></div>
+		</div>
+
+		<?php if ( ! $has_key ) : ?>
+		<div class="loom-card loom-card-warn"><p>⚠️ <?php esc_html_e( 'Dodaj klucz API OpenAI w', 'loom' ); ?> <a href="<?php echo esc_url( admin_url( 'admin.php?page=loom-settings' ) ); ?>"><?php esc_html_e( 'ustawieniach', 'loom' ); ?></a></p></div>
+		<?php endif; ?>
+
+		<?php // ═══ MONEY PAGES TAB ═══
+		elseif ( $tab === 'money' ) :
+			$money_pages = Loom_DB::get_money_pages_health();
+		?>
+		<div class="loom-card">
+			<div class="loom-card-header"><h2>⭐ <?php esc_html_e( 'Money Pages  -  status linkowania', 'loom' ); ?></h2><span class="loom-badge loom-b-neutral"><?php echo esc_html( count( $money_pages ) ); ?> stron</span></div>
+			<?php if ( ! empty( $money_pages ) ) : ?>
+			<table class="loom-tbl"><thead><tr>
+				<th><?php esc_html_e( 'Strona', 'loom' ); ?></th><th class="loom-tc">Prio</th><th>Linki / Cel</th><th class="loom-tc">Anchor%</th><th class="loom-tc">GSC Pos</th><th class="loom-tc">Impr</th><th class="loom-tc">Status</th>
+			</tr></thead><tbody>
+			<?php foreach ( $money_pages as $mp ) :
+				$pct = $mp['goal'] > 0 ? round( $mp['current'] / $mp['goal'] * 100 ) : 0;
+				$bar_cls = $mp['deficit'] > 4 ? 'loom-progress-fill-bad' : ( $mp['deficit'] > 0 ? 'loom-progress-fill-warn' : 'loom-progress-fill-ok' );
+			?>
+			<tr>
+				<td><a href="<?php echo esc_url( get_edit_post_link( $mp['post_id'] ) ); ?>" class="loom-link"><?php echo esc_html( mb_substr( $mp['title'], 0, 40 ) ); ?></a></td>
+				<td class="loom-tc"><?php echo esc_html( str_repeat( '⭐', intval( $mp['priority'] ) ) ); ?></td>
+				<td>
+					<div style="display:flex;align-items:center;gap:6px">
+						<strong><?php echo esc_html( $mp['current'] ); ?></strong>
+						<div class="loom-progress" style="flex:1"><div class="loom-progress-fill <?php echo esc_attr( $bar_cls ); ?>" style="width:<?php echo esc_attr( $pct ); ?>%"></div></div>
+						<span class="loom-muted"><?php echo esc_html( $mp['goal'] ); ?></span>
+					</div>
+				</td>
+				<td class="loom-tc <?php echo intval( $mp['anchor_diversity'] ) < 60 ? 'style="color:var(--bad);font-weight:700"' : ''; ?>"><?php echo esc_html( $mp['anchor_diversity'] ); ?>%</td>
+				<td class="loom-tc loom-tn"><?php echo floatval( $mp['gsc_position'] ?? 0 ) > 0 ? esc_html( number_format( $mp['gsc_position'], 1 ) ) : ' - '; ?></td>
+				<td class="loom-tc loom-tn"><?php echo intval( $mp['gsc_impressions'] ?? 0 ) > 0 ? esc_html( number_format( $mp['gsc_impressions'] ) ) : ' - '; ?></td>
+				<td class="loom-tc">
+					<?php if ( $mp['status'] === 'critical' ) : ?><span class="loom-badge loom-b-bad">🔴 Krytyczny</span>
+					<?php elseif ( $mp['status'] === 'needs_more' ) : ?><span class="loom-badge loom-b-warn">🟡 Potrzebuje</span>
+					<?php else : ?><span class="loom-badge loom-b-ok">🟢 OK</span><?php endif; ?>
+				</td>
+			</tr>
+			<?php endforeach; ?>
+			</tbody></table>
+			<?php else : ?>
+			<div class="loom-card-body"><p class="loom-muted"><?php esc_html_e( 'Oznacz strony jako money pages klikając ⭐ w tabeli postów.', 'loom' ); ?></p></div>
+			<?php endif; ?>
+		</div>
+
+		<?php // ═══ STRIKING DISTANCE TAB ═══
+		elseif ( $tab === 'striking' ) :
+			global $wpdb;
+			$idx = Loom_DB::index_table();
+			$striking_pages = $wpdb->get_results(
+				"SELECT post_id, post_title, post_url, gsc_position, gsc_impressions, gsc_ctr, gsc_clicks, gsc_top_queries
+				 FROM {$idx} WHERE is_striking_distance = 1 ORDER BY gsc_position ASC LIMIT 30", ARRAY_A
+			);
+		?>
+		<div class="loom-card">
+			<div class="loom-card-header">
+				<h2>🎯 <?php esc_html_e( 'Striking Distance  -  strony o krok od page 1', 'loom' ); ?></h2>
+				<?php if ( $gsc_on ) : ?>
+				<button class="loom-btn loom-btn-sm loom-btn-purple" id="loom-gsc-sync">🔄 <?php esc_html_e( 'Sync GSC', 'loom' ); ?></button>
+				<?php endif; ?>
+			</div>
+			<?php if ( ! empty( $striking_pages ) ) : ?>
+			<table class="loom-tbl"><thead><tr>
+				<th><?php esc_html_e( 'Strona', 'loom' ); ?></th><th class="loom-tc">Pozycja</th><th class="loom-tc">Impressions</th><th class="loom-tc">CTR</th><th class="loom-tc">Clicks</th><th>Top query</th><th class="loom-tc">ROI</th>
+			</tr></thead><tbody>
+			<?php foreach ( $striking_pages as $sp ) :
+				$pos   = floatval( $sp['gsc_position'] );
+				$impr  = intval( $sp['gsc_impressions'] );
+				$roi   = $impr > 5000 ? 'high' : ( $impr > 1000 ? 'medium' : 'low' );
+				$query = '';
+				$qdata = json_decode( $sp['gsc_top_queries'] ?? '[]', true );
+				if ( ! empty( $qdata[0]['query'] ) ) $query = $qdata[0]['query'];
+			?>
+			<tr>
+				<td><a href="<?php echo esc_url( get_edit_post_link( $sp['post_id'] ) ); ?>" class="loom-link"><?php echo esc_html( mb_substr( $sp['post_title'], 0, 40 ) ); ?></a></td>
+				<td class="loom-tc"><span class="loom-tn" style="font-size:16px;font-weight:800;color:<?php echo $pos <= 12 ? 'var(--ok)' : 'var(--purple)'; ?>"><?php echo esc_html( number_format( $pos, 1 ) ); ?></span></td>
+				<td class="loom-tc loom-tn"><?php echo esc_html( number_format( $impr ) ); ?></td>
+				<td class="loom-tc"><?php echo esc_html( number_format( floatval( $sp['gsc_ctr'] ) * 100, 1 ) ); ?>%</td>
+				<td class="loom-tc loom-tn" style="font-weight:700"><?php echo esc_html( $sp['gsc_clicks'] ); ?></td>
+				<td><?php if ( $query ) : ?><span class="loom-code"><?php echo esc_html( $query ); ?></span><?php else : ?> - <?php endif; ?></td>
+				<td class="loom-tc">
+					<?php if ( $roi === 'high' ) : ?><span class="loom-badge loom-b-ok">🚀 Wysoki</span>
+					<?php elseif ( $roi === 'medium' ) : ?><span class="loom-badge loom-b-warn">📈 Średni</span>
+					<?php else : ?><span class="loom-badge loom-b-neutral">📊 Niski</span><?php endif; ?>
+				</td>
+			</tr>
+			<?php endforeach; ?>
+			</tbody></table>
+			<?php elseif ( ! $gsc_on ) : ?>
+			<div class="loom-card-body"><p class="loom-muted">🔌 <?php esc_html_e( 'Połącz Google Search Console w ustawieniach aby zobaczyć dane.', 'loom' ); ?></p></div>
+			<?php else : ?>
+			<div class="loom-card-body"><p class="loom-muted"><?php esc_html_e( 'Brak stron w striking distance. Kliknij Sync GSC.', 'loom' ); ?></p></div>
+			<?php endif; ?>
+		</div>
+
+		<?php // ═══ GRAPH TAB ═══
+		elseif ( $tab === 'graph' ) : ?>
+		<div class="loom-card">
+			<div class="loom-card-header">
+				<h2>🕸️ <?php esc_html_e( 'Mapa powiązań', 'loom' ); ?></h2>
+				<div style="display:flex;gap:8px;align-items:center">
+					<div class="loom-map-legend">
+						<span><span class="loom-dot" style="background:var(--l)"></span> Hub</span>
+						<span><span class="loom-dot" style="background:var(--muted)"></span> Normal</span>
+						<span><span class="loom-dot" style="background:var(--bad)"></span> Orphan</span>
+						<span><span class="loom-dot" style="background:var(--warn)"></span> Dead End</span>
+						<span><span class="loom-dot" style="background:#3b82f6"></span> Bridge</span>
+						<span><span class="loom-dot" style="background:var(--purple)"></span> Striking</span>
+						<span><span class="loom-dot" style="background:#eab308"></span> Money</span>
+					</div>
+					<button class="loom-btn loom-btn-sm loom-btn-outline" id="loom-recalc-graph">🔄</button>
+				</div>
+			</div>
+			<canvas id="loom-link-map" width="1100" height="380"></canvas>
+			<p class="loom-map-hint"><?php esc_html_e( 'Rozmiar = linki IN · Kolor = typ · Teal lines = LOOM', 'loom' ); ?></p>
+		</div>
+
+		<?php // ═══ POSTS TAB ═══
+		elseif ( $tab === 'posts' ) : ?>
+		<div class="loom-card">
+			<div class="loom-filters">
+				<?php
+				$filters = array(
+					''          => sprintf( __( 'Wszystkie (%d)', 'loom' ), $s['total_posts'] ),
+					'orphans'   => '🔴 Orphany',
+					'weak'      => '🟡 Słabe',
+					'money'     => '⭐ Money',
+					'striking'  => '🎯 Striking',
+					'deadends'  => '⚫ Dead Ends',
+				);
+				foreach ( $filters as $fv => $fl ) :
+					$href = add_query_arg( array( 'tab' => 'posts', 'filter' => $fv ), admin_url( 'admin.php?page=loom' ) );
+				?>
+				<a href="<?php echo esc_url( $href ); ?>" class="loom-filter <?php echo $filter === $fv ? 'active' : ''; ?>"><?php echo esc_html( $fl ); ?></a>
+				<?php endforeach; ?>
+			</div>
+			<table class="loom-tbl"><thead><tr>
+				<th><?php esc_html_e( 'Tytuł', 'loom' ); ?></th>
+				<th class="loom-tc">IN</th><th class="loom-tc">OUT</th><th class="loom-tc">PR</th>
+				<th class="loom-tc">Depth</th><th class="loom-tc">GSC</th><th class="loom-tc">Impr</th>
+				<th>Keywords</th><th class="loom-tc">Status</th><th class="loom-tc"><?php esc_html_e( 'Akcja', 'loom' ); ?></th>
+			</tr></thead><tbody>
+			<?php foreach ( $posts as $row ) :
+				if ( $filter === 'orphans' && empty( $row['is_orphan'] ) ) continue;
+				if ( $filter === 'weak' && ( intval( $row['incoming_links_count'] ) >= 3 || ! empty( $row['is_orphan'] ) ) ) continue;
+				if ( $filter === 'money' && empty( $row['is_money_page'] ) ) continue;
+				if ( $filter === 'striking' && empty( $row['is_striking_distance'] ) ) continue;
+				if ( $filter === 'deadends' && empty( $row['is_dead_end'] ) ) continue;
+
+				$in      = intval( $row['incoming_links_count'] );
+				$is_mp   = ! empty( $row['is_money_page'] );
+				$gsc_pos = floatval( $row['gsc_position'] ?? 0 );
+				$gsc_imp = intval( $row['gsc_impressions'] ?? 0 );
+				$pr_val  = isset( $row['internal_pagerank'] ) && $row['internal_pagerank'] !== null ? number_format( floatval( $row['internal_pagerank'] ) * 100, 1 ) : ' - ';
+				$d       = $row['click_depth'];
+				$ds      = ( $d !== null && $d !== '' ) ? intval( $d ) : ' - ';
+
+				// Keywords
+				$kw_data = ! empty( $row['focus_keywords'] ) ? json_decode( $row['focus_keywords'], true ) : array();
+			?>
+			<tr>
+				<td>
+					<button class="loom-money-toggle <?php echo $is_mp ? 'active' : ''; ?>" data-post-id="<?php echo esc_attr( $row['post_id'] ); ?>" data-is-money="<?php echo $is_mp ? '1' : '0'; ?>"><?php echo $is_mp ? '⭐' : '☆'; ?></button>
+					<a href="<?php echo esc_url( get_edit_post_link( $row['post_id'] ) ); ?>" class="loom-link"><?php echo esc_html( mb_substr( $row['post_title'], 0, 45 ) ); ?></a>
+					<span class="loom-muted" style="font-size:10px;margin-left:4px"><?php echo esc_html( $row['post_type'] ); ?></span>
+				</td>
+				<td class="loom-tc" style="font-weight:700"><?php echo esc_html( $in ); ?></td>
+				<td class="loom-tc loom-muted"><?php echo esc_html( $row['outgoing_links_count'] ); ?></td>
+				<td class="loom-tc loom-tn"><?php echo esc_html( $pr_val ); ?></td>
+				<td class="loom-tc"><?php echo esc_html( $ds ); ?></td>
+				<td class="loom-tc"><?php
+					if ( $gsc_pos > 0 ) {
+						$gc = $gsc_pos <= 10 ? 'var(--ok)' : ( $gsc_pos <= 20 ? 'var(--purple)' : 'var(--muted)' );
+						echo '<span class="loom-tn" style="font-weight:700;color:' . esc_attr( $gc ) . '">' . esc_html( number_format( $gsc_pos, 1 ) ) . '</span>';
+					} else { echo '<span class="loom-muted"> - </span>'; }
+				?></td>
+				<td class="loom-tc loom-tn" style="font-size:10px"><?php echo $gsc_imp > 0 ? esc_html( number_format( $gsc_imp ) ) : '<span class="loom-muted"> - </span>'; ?></td>
+				<td><?php if ( ! empty( $kw_data ) ) : ?><div style="display:flex;flex-wrap:wrap;gap:2px"><?php foreach ( array_slice( $kw_data, 0, 2 ) as $kw ) : ?><span class="loom-code" style="font-size:9px"><?php echo esc_html( mb_substr( $kw['phrase'], 0, 20 ) ); ?></span><?php endforeach; ?></div><?php endif; ?></td>
+				<td class="loom-tc">
+					<?php
+					if ( $row['is_orphan'] )   echo '<span class="loom-badge loom-b-bad">Orphan</span>';
+					if ( $row['is_dead_end'] ) echo '<span class="loom-badge loom-b-warn">DE</span>';
+					if ( $row['is_bridge'] )   echo '<span class="loom-badge loom-b-neutral">🌉</span>';
+					if ( ! empty( $row['is_striking_distance'] ) ) echo '<span class="loom-badge loom-b-striking">🎯</span>';
+					if ( $is_mp )              echo '<span class="loom-badge loom-b-money">💰</span>';
+					if ( ! $row['is_orphan'] && ! $row['is_dead_end'] && $in >= 3 ) echo '<span class="loom-badge loom-b-ok">OK</span>';
+					if ( ! $row['is_orphan'] && $in > 0 && $in < 3 ) echo '<span class="loom-badge loom-b-warn">Słaby</span>';
+					?>
+				</td>
+				<td class="loom-tc"><?php if ( $has_key ) : ?>
+					<button class="loom-btn loom-btn-sm loom-podlinkuj-btn" data-post-id="<?php echo esc_attr( $row['post_id'] ); ?>">🔗</button>
+					<button class="loom-btn loom-btn-sm loom-btn-ok loom-auto-btn" data-post-id="<?php echo esc_attr( $row['post_id'] ); ?>">⚡</button>
+				<?php endif; ?></td>
+			</tr>
+			<?php endforeach; ?>
+			</tbody></table>
+		</div>
+
+		<?php // ═══ SETTINGS TAB ═══
+		elseif ( $tab === 'settings' ) : ?>
+		<div class="loom-grid-2">
+			<!-- Weights -->
+			<div class="loom-card"><div class="loom-card-body">
+				<h3 style="font-size:13px;font-weight:700;margin-bottom:12px"><?php esc_html_e( 'Wagi composite score (9 wymiarów)', 'loom' ); ?></h3>
+				<?php
+				$dims = array(
+					array( 'semantic', '🧠', 'Semantic', 'Cosine similarity' ),
+					array( 'orphan', '🔴', 'Orphan', 'Brak linków IN' ),
+					array( 'depth', '📐', 'Depth', 'Click depth' ),
+					array( 'tier', '🏛️', 'Tier', 'Hierarchia strony' ),
+					array( 'cluster', '🧩', 'Cluster', 'Topic cluster' ),
+					array( 'equity', '📈', 'Velocity', 'Tempo linkowania' ),
+					array( 'graph', '🕸️', 'Graph', 'PageRank + topology' ),
+					array( 'money', '💰', 'Money', 'Money page boost' ),
+					array( 'gsc', '📊', 'GSC', 'Search Console data' ),
+					array( 'authority', '🏆', 'Authority', 'Topical authority' ),
+					array( 'placement', '📍', 'Placement', 'Paragraph match quality' ),
+				);
+				foreach ( $dims as $d ) :
+					$val = round( floatval( $settings[ 'weight_' . $d[0] ] ?? 0.1 ) * 100 );
+				?>
+				<div class="loom-weight-row">
+					<span class="loom-weight-icon"><?php echo $d[1]; ?></span>
+					<div class="loom-weight-info"><div class="loom-weight-name"><?php echo esc_html( $d[2] ); ?></div><div class="loom-weight-desc"><?php echo esc_html( $d[3] ); ?></div></div>
+					<input type="range" class="loom-weight-slider" min="0" max="50" step="1" value="<?php echo esc_attr( $val ); ?>" data-key="weight_<?php echo esc_attr( $d[0] ); ?>">
+					<span class="loom-weight-pct"><?php echo esc_html( $val ); ?>%</span>
+				</div>
+				<?php endforeach; ?>
+				<div class="loom-weight-sum">
+					<span style="font-size:11px;color:var(--muted)">Suma:</span>
+					<span id="loom-weight-sum" style="font-size:12px;font-weight:700;font-family:var(--mono)">100%</span>
+				</div>
+				<div style="display:flex;gap:6px;margin-top:8px">
+					<button class="loom-btn loom-btn-sm" id="loom-save-weights"><?php esc_html_e( 'Zapisz', 'loom' ); ?></button>
+					<button class="loom-btn loom-btn-sm loom-btn-gray" id="loom-normalize-weights"><?php esc_html_e( 'Normalizuj', 'loom' ); ?></button>
+				</div>
+			</div></div>
+
+			<!-- GSC + General -->
+			<div style="display:flex;flex-direction:column;gap:14px">
+				<div class="loom-card"><div class="loom-card-body">
+					<h3 style="font-size:13px;font-weight:700;margin-bottom:10px">📊 Google Search Console</h3>
+					<div class="loom-gsc-status" style="margin-bottom:10px">
+						<span class="loom-gsc-dot <?php echo $gsc_on ? 'loom-gsc-dot-on' : 'loom-gsc-dot-off'; ?>"></span>
+						<span><?php echo $gsc_on ? esc_html__( 'Połączony', 'loom' ) : esc_html__( 'Niepołączony', 'loom' ); ?></span>
+						<?php if ( $s['last_gsc_sync'] ) : ?><span class="loom-muted" style="margin-left:auto;font-size:10px">Sync: <?php echo esc_html( $s['last_gsc_sync'] ); ?></span><?php endif; ?>
+					</div>
+					<div style="display:flex;gap:6px">
+						<?php if ( $gsc_on ) : ?>
+						<button class="loom-btn loom-btn-sm loom-btn-purple" id="loom-gsc-sync">🔄 Sync</button>
+						<button class="loom-btn loom-btn-sm loom-btn-danger" id="loom-gsc-disconnect"><?php esc_html_e( 'Rozłącz', 'loom' ); ?></button>
+						<?php else : ?>
+						<a href="<?php echo esc_url( admin_url( 'admin.php?page=loom-settings' ) ); ?>" class="loom-btn loom-btn-sm loom-btn-purple"><?php esc_html_e( 'Połącz GSC', 'loom' ); ?></a>
+						<?php endif; ?>
+					</div>
+				</div></div>
+
+				<div class="loom-card"><div class="loom-card-body">
+					<h3 style="font-size:13px;font-weight:700;margin-bottom:10px">🎛️ <?php esc_html_e( 'Ogólne', 'loom' ); ?></h3>
+					<div class="loom-settings-row"><label>Min. similarity</label><input type="number" class="loom-settings-input" name="loom_min_similarity" value="<?php echo esc_attr( $settings['min_similarity'] ?? 0.35 ); ?>" min="0.1" max="0.8" step="0.05"></div>
+					<div class="loom-settings-row"><label>Max sugestii</label><input type="number" class="loom-settings-input" name="loom_max_suggestions" value="<?php echo esc_attr( $settings['max_suggestions'] ?? 8 ); ?>" min="3" max="15"></div>
+					<div class="loom-settings-row"><label>Język</label>
+						<select class="loom-settings-select" name="loom_language">
+							<option value="pl" <?php selected( $settings['language'] ?? 'pl', 'pl' ); ?>>🇵🇱 Polski</option>
+							<option value="en" <?php selected( $settings['language'] ?? 'pl', 'en' ); ?>>🇬🇧 English</option>
+							<option value="de" <?php selected( $settings['language'] ?? 'pl', 'de' ); ?>>🇩🇪 Deutsch</option>
+						</select>
+					</div>
+				</div></div>
+			</div>
+		</div>
+
+		<?php endif; // end tabs ?>
+		<?php endif; // end scanned check ?>
+
+		<div id="loom-suggestions-panel" style="display:none;"></div>
+		</div>
+		<?php
+	}
+}
